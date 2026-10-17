@@ -1,0 +1,54 @@
+name: Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: '整个作业时长(分钟)'
+        type: choice
+        default: '60'
+        options: ['15', '30', '60', '120', '240', '300', '360']
+      warp_enabled:
+        description: 'Warpscout 代理模式'
+        type: choice
+        default: 'proxy'
+        options: ['off', 'proxy']
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: ${{ fromJSON(inputs.duration) }}
+    env:
+      KRYVA_API_KEY: ${{ secrets.KRYVA_API_KEY || vars.KRYVA_API_KEY }}
+      KRYVA_API_URL: ${{ secrets.KRYVA_API_URL || vars.KRYVA_API_URL }}
+      CLOUDFLARED_TOKEN: ${{ secrets.CLOUDFLARED_TOKEN || vars.CLOUDFLARED_TOKEN }}
+      PASSWORD: ${{ secrets.PASSWORD || vars.PASSWORD }}
+      WARPSCOUT_COUNTRY: ${{ secrets.WARPSCOUT_COUNTRY || vars.WARPSCOUT_COUNTRY }}
+      WARP_ENABLED: ${{ inputs.warp_enabled }}
+
+    steps:
+      - name: Record job start
+        shell: bash
+        run: printf 'JOB_STARTED_AT=%s\n' "$(date -u +%s)" >> "$GITHUB_ENV"
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install
+        shell: pwsh
+        run: .\scripts\windows.ps1
+
+      - name: Keep alive
+        shell: bash
+        run: bash ./scripts/keep_alive.sh windows ${{ inputs.duration }}
+
+      - name: Stop Warpscout proxy
+        if: ${{ always() }}
+        shell: pwsh
+        run: .\scripts\windows.ps1 -Action Cleanup
+
+      - name: Delete workflow runs
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          retain_days: 0
+          keep_minimum_runs: 2

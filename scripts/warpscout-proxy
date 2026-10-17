@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# 管理 Warpscout 本地 SOCKS5 代理.
+# 参考 docker/desktop/scripts/warpscout-proxy, 去掉 flock 依赖以便在 macOS 和 Linux 共用.
+set -Eeuo pipefail
+
+readonly STATE_DIR="${WARPSCOUT_STATE_DIR:-${XDG_STATE_HOME:-${HOME}/.local/state}/warpscout}"
+readonly ACCOUNT_FILE="${STATE_DIR}/account.json"
+readonly PID_FILE="${STATE_DIR}/proxy.pid"
+readonly LOCK_DIR="${STATE_DIR}/proxy.lock"
+readonly LOG_FILE="${STATE_DIR}/proxy.log"
+readonly PROTO=awg
+readonly HOST=127.0.0.1
+readonly PORT=40000
+
+# 判断 PID 是否属于当前脚本启动的 Warpscout SOCKS5 进程.
+is_proxy_process() {
+    local pid="$1" command_line
+
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    command_line="$(ps -p "$pid" -o command= 2>/dev/null)"
+    [[ "$command_line" == *"warpscout socks"* ]]
+}
+
+# 读取当前代理 PID.
+read_pid() {
+    [[ -s "$PID_FILE" ]] || return 1
+    tr -d '[:space:]' < "$PID_FILE"
+}
+
+# 用目录创建作为启动锁, 避免并发启动; 持有者退出后按 PID 判定残留锁.
+acquire_lock() {
+    local owner=""
+
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf '%s\n' "$$" > "$LOCK_DIR/owner"
+        trap 'rm -rf -- "$LOCK_DIR"' EXIT
+        return 0
+    fi
+    owner="$(cat "$LOCK_DIR/owner" 2>/dev/null || true)"
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+        return 1
+    fi
+    rm -rf -- "$LOCK_DIR"
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        printf '%s\n' "$$" > "$LOCK_DIR/owner"
+        trap 'rm -rf -- "$LOCK_DIR"' EXIT
+        return 0
+    fi
+    return 1
+}
+
+# 注册并复用账号, 选择端点后在后台启动代理.
+cmd_start() {
+    local endpoint pid
+    local country="${WARPSCOUT_COUNTRY:-US}"
+
+    umask 077
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+
+    if ! acquire_lock; then
+        printf 'Warpscout proxy is starting or already running\n'
+        return 0
+    fi
+
+    if pid="$(read_pid 2>/dev/null)" && is_proxy_process "$pid"; then
+        printf 'Warpscout proxy is running: PID %s, socks5h://%s:%s\n' "$pid" "$HOST" "$PORT"
+        return 0
+    fi
+    rm -f "$PID_FILE"
+
+    if [[ ! -s "$ACCOUNT_FILE" ]]; then
+        warpscout register -a "$ACCOUNT_FILE"
+    fi
+    chmod 600 "$ACCOUNT_FILE"
+
+    endpoint="$(warpscout scan -a "$ACCOUNT_FILE" -p "$PROTO" -P -country "$country" -best)"
+    if [[ -z "$endpoint" ]]; then
+        printf 'Warpscout did not find an available endpoint\n' >&2
+        return 1
+    fi
+
+    nohup warpscout socks -a "$ACCOUNT_FILE" -p "$PROTO" -e "$endpoint" \
+        -l "$HOST" -P "$PORT" </dev/null >>"$LOG_FILE" 2>&1 &
+    pid=$!
+    printf '%s\n' "$pid" > "$PID_FILE"
+
+    # 捕获参数错误或端口占用等立即退出场景.
+    sleep 1
+    if ! is_proxy_process "$pid"; then
+        rm -f "$PID_FILE"
+        printf 'Warpscout proxy failed to start, inspect %s\n' "$LOG_FILE" >&2
+        return 1
+    fi
+
+    printf 'Warpscout proxy started: PID %s, socks5h://%s:%s, log: %s\n' \
+        "$pid" "$HOST" "$PORT" "$LOG_FILE"
+}
+
+# 停止当前脚本启动的代理.
+cmd_stop() {
+    local pid attempt
+
+    if ! pid="$(read_pid 2>/dev/null)" || ! is_proxy_process "$pid"; then
+        rm -f "$PID_FILE"
+        printf 'Warpscout proxy is not running\n'
+        return 0
+    fi
+
+    kill "$pid"
+    for attempt in {1..50}; do
+        if ! is_proxy_process "$pid"; then
+            rm -f "$PID_FILE"
+            printf 'Warpscout proxy stopped\n'
+            return 0
+        fi
+        sleep 0.1
+    done
+
+    printf 'Warpscout proxy did not stop within 5 seconds: PID %s\n' "$pid" >&2
+    return 1
+}
+
+# 输出当前代理状态.
+cmd_status() {
+    local pid
+
+    if pid="$(read_pid 2>/dev/null)" && is_proxy_process "$pid"; then
+        printf 'Warpscout proxy is running: PID %s, socks5h://%s:%s, log: %s\n' \
+            "$pid" "$HOST" "$PORT" "$LOG_FILE"
+        return 0
+    fi
+
+    printf 'Warpscout proxy is not running\n'
+    return 3
+}
+
+# 输出命令用法.
+usage() {
+    printf 'Usage: %s <start|stop|status>\n' "$(basename "$0")"
+}
+
+# 分发子命令.
+main() {
+    case "${1:-}" in
+        start) cmd_start ;;
+        stop) cmd_stop ;;
+        status) cmd_status ;;
+        -h|--help|help|'') usage ;;
+        *)
+            printf 'Unknown operation: %s\n' "$1" >&2
+            usage >&2
+            return 2
+            ;;
+    esac
+}
+
+main "$@"

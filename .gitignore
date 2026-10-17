@@ -1,0 +1,6 @@
+__pycache__/
+.env
+*.log
+screenshot/
+data/
+.remotelab-sync-*/
